@@ -34,6 +34,7 @@ TERMINAL_OUTPUT_FOLDER = None
 DEFAULT_VOLUME = 0.1
 SL_GROUP_INDEXES = [4]
 TP_GROUP_INDEXES = [6]
+SYMBOL_MAPPING = {}
 
 
 def read_config_section(config_file):
@@ -107,6 +108,30 @@ def parse_signal_patterns(raw_patterns):
         raise ValueError("SIGNAL_PATTERNS must resolve to a dictionary.")
     return parsed
 
+
+def parse_symbol_mapping(raw_mapping):
+    """Parse SYMBOL_MAPPING from JSON or Python-literal text."""
+    if not raw_mapping:
+        return {}
+
+    text = raw_mapping.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        text = text[1:-1]
+
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            parsed = parser(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+    normalized = re.sub(r"(?<!\\)\\(?![\\\"/bfnrtu])", r"\\\\", text)
+    parsed = json.loads(normalized)
+    if not isinstance(parsed, dict):
+        raise ValueError("SYMBOL_MAPPING must resolve to a dictionary.")
+    return parsed
+
 def _parse_group_indexes(raw, default):
     """Parse a comma-separated list of regex group indexes from a config string."""
     if not raw:
@@ -126,7 +151,7 @@ def load_chat_config(config_file):
     global CHANNEL_USERNAME, CHANNEL_ID, SIGNAL_PATTERNS, DB_SOURCE, CHAT_CONFIG
     global BROKER, SYMBOL_POSTFIX, TRADING_PLATFORM
     global TERMINAL_INPUT_FOLDER, TERMINAL_OUTPUT_FOLDER, DEFAULT_VOLUME
-    global SL_GROUP_INDEXES, TP_GROUP_INDEXES
+    global SL_GROUP_INDEXES, TP_GROUP_INDEXES, SYMBOL_MAPPING
 
     if not os.path.exists(config_file):
         print(f"Error: Chat config file '{config_file}' not found.")
@@ -166,6 +191,9 @@ def load_chat_config(config_file):
         patterns_str = section.get("SIGNAL_PATTERNS", "{}")
         SIGNAL_PATTERNS = parse_signal_patterns(patterns_str)
 
+        symbol_mapping_str = section.get("SYMBOL_MAPPING", "{}")
+        SYMBOL_MAPPING = parse_symbol_mapping(symbol_mapping_str)
+
         SL_GROUP_INDEXES = _parse_group_indexes(section.get("SL_GROUP"), [4])
         TP_GROUP_INDEXES = _parse_group_indexes(section.get("TP_GROUP"), [6])
 
@@ -187,11 +215,74 @@ def load_chat_config(config_file):
         print(f"Default volume: {DEFAULT_VOLUME}")
         print(f"SL group indexes: {SL_GROUP_INDEXES}")
         print(f"TP group indexes: {TP_GROUP_INDEXES}")
+        print(f"Symbol mapping entries: {len(SYMBOL_MAPPING)}")
         print(f"Terminal input folder: {TERMINAL_INPUT_FOLDER}")
         print(f"Terminal output folder: {TERMINAL_OUTPUT_FOLDER}")
     except Exception as exc:
         print(f"Error loading chat config: {exc}")
         sys.exit(1)
+
+
+def normalize_signal_symbol(symbol):
+    """Normalize a signal symbol to a key-safe uppercase format."""
+    return re.sub(r"[^A-Za-z0-9._-]", "", (symbol or "").strip()).upper()
+
+
+def sync_symbol_mappings_to_db():
+    """Insert configured symbol mappings into DB if missing."""
+    if not SYMBOL_MAPPING:
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    inserted = 0
+    for signal_symbol, mapped_symbol in SYMBOL_MAPPING.items():
+        signal_key = normalize_signal_symbol(str(signal_symbol))
+        mapped_value = str(mapped_symbol).strip()
+        if not signal_key or not mapped_value:
+            continue
+
+        c.execute(
+            """
+            INSERT OR IGNORE INTO symbol_mappings (source, signal_symbol, mapped_symbol)
+            VALUES (?, ?, ?)
+            """,
+            (DB_SOURCE, signal_key, mapped_value),
+        )
+        if c.rowcount > 0:
+            inserted += 1
+
+    conn.commit()
+    conn.close()
+
+    if inserted:
+        print(f"Inserted {inserted} new symbol mapping(s) for source '{DB_SOURCE}'")
+
+
+def get_mapped_symbol(signal_symbol):
+    """Get mapped broker symbol for a normalized signal symbol from DB."""
+    signal_key = normalize_signal_symbol(signal_symbol)
+    if not signal_key:
+        return None
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT mapped_symbol
+        FROM symbol_mappings
+        WHERE source = ? AND signal_symbol = ?
+        LIMIT 1
+        """,
+        (DB_SOURCE, signal_key),
+    )
+    row = c.fetchone()
+    conn.close()
+
+    if row and row[0]:
+        return str(row[0]).strip()
+    return None
 
 
 def init_db():
@@ -238,11 +329,16 @@ def parse_message_ids(input_str):
     return sorted(message_ids)
 
 
-def apply_symbol_postfix(symbol):
-    symbol = re.sub(r"[^A-Za-z0-9._-]", "", symbol.lower().capitalize())
-    if SYMBOL_POSTFIX and not symbol.endswith(SYMBOL_POSTFIX):
-        return f"{symbol}{SYMBOL_POSTFIX}"
-    return symbol
+def resolve_symbol(signal_symbol):
+    """Resolve symbol by DB mapping first, else fallback to UPPERCASE+postfix."""
+    mapped_symbol = get_mapped_symbol(signal_symbol)
+    if mapped_symbol:
+        return mapped_symbol
+
+    fallback_symbol = normalize_signal_symbol(signal_symbol)
+    if SYMBOL_POSTFIX and not fallback_symbol.endswith(SYMBOL_POSTFIX):
+        return f"{fallback_symbol}{SYMBOL_POSTFIX}"
+    return fallback_symbol
 
 
 def _pick_group(match, indexes):
@@ -275,7 +371,7 @@ def parse_signal_message(message_text):
             continue
 
         side = "BUY" if action == "create_buy" else "SELL"
-        raw_symbol = match.group(1).replace("/", "")
+        raw_symbol = match.group(1)
         price = 0.0
         raw_sl = _pick_group(match, SL_GROUP_INDEXES)
         raw_tp = _pick_group(match, TP_GROUP_INDEXES)
@@ -284,7 +380,7 @@ def parse_signal_message(message_text):
 
         return {
             "action": "CREATE",
-            "symbol": apply_symbol_postfix(raw_symbol),
+            "symbol": resolve_symbol(raw_symbol),
             "type": "MARKET",
             "side": side,
             "volume": DEFAULT_VOLUME,
@@ -395,6 +491,7 @@ async def main():
     chat_config_file = sys.argv[1]
     load_chat_config(chat_config_file)
     init_db()
+    sync_symbol_mappings_to_db()
 
     if len(sys.argv) > 2:
         message_ids = parse_message_ids(sys.argv[2])

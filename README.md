@@ -11,7 +11,9 @@ The current monitor script is `telegram_signal_monitor_mt.py` and supports both 
 3. Resolves the target Telegram chat by `CHAT_ID` and/or `CHAT_USERNAME`.
 4. Parses only direct open signals using regex patterns from `SIGNAL_PATTERNS`.
 5. Creates one JSON input file per message in terminal `Files/input`.
-6. Stores message metadata in SQLite.
+6. Syncs configured symbol mappings into DB (insert-if-missing).
+7. Resolves symbols using DB mapping first, otherwise fallback to `UPPERCASE(signal_symbol)+SYMBOL_POSTFIX`.
+8. Stores message metadata in SQLite.
 
 Important: parsed open signals are generated as `action=CREATE` with `type=MARKET` and `side=BUY/SELL`. Price is set to `0.0` in JSON and execution side/price is resolved by the EA at order time.
 
@@ -89,10 +91,11 @@ python telegram_signal_monitor_mt.py my_channel.ini "123,130-135,200"
 9. `SIGNAL_PATTERNS` (optional): Regex dictionary with keys `create_buy` and `create_sell`.
 10. `SL_GROUP` (optional): Comma-separated regex group indexes for stop-loss extraction. Default `[4]`.
 11. `TP_GROUP` (optional): Comma-separated regex group indexes for take-profit extraction. Default `[6]`.
-12. `AI_PROMPT_CUSTOM` (currently informational): Present in config files but not used by `telegram_signal_monitor_mt.py`.
-13. `ENABLE_AI_FILTERING` (currently informational): Present in config files but not used by `telegram_signal_monitor_mt.py`.
-14. `FALLBACK_TO_REGEX` (currently informational): Present in config files but not used by `telegram_signal_monitor_mt.py`.
-15. `MT_BASE_PATH` in config file (currently informational): The script uses environment variable `MT_BASE_PATH`, not this config key.
+12. `SYMBOL_MAPPING` (optional): Dictionary mapping incoming signal symbols to broker symbols (stored in DB table `symbol_mappings`).
+13. `AI_PROMPT_CUSTOM` (currently informational): Present in config files but not used by `telegram_signal_monitor_mt.py`.
+14. `ENABLE_AI_FILTERING` (currently informational): Present in config files but not used by `telegram_signal_monitor_mt.py`.
+15. `FALLBACK_TO_REGEX` (currently informational): Present in config files but not used by `telegram_signal_monitor_mt.py`.
+16. `MT_BASE_PATH` in config file (currently informational): The script uses environment variable `MT_BASE_PATH`, not this config key.
 
 Minimum required chat config:
 - One of `CHAT_USERNAME` or `CHAT_ID`.
@@ -114,7 +117,7 @@ Example output file (`<msg_id>.json`):
 ```json
 {
   "action": "CREATE",
-  "symbol": "Xauusd",
+  "symbol": "XAUUSDm",
   "type": "MARKET",
   "side": "BUY",
   "volume": 0.1,
