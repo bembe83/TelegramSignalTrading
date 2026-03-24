@@ -32,10 +32,12 @@ TRADING_PLATFORM = "MT5"
 TERMINAL_INPUT_FOLDER = None
 TERMINAL_OUTPUT_FOLDER = None
 DEFAULT_VOLUME = 0.1
+DIRECTION_GROUP = 1
+SYMBOL_GROUP = 2
+PRICE_GROUP = 3
 SL_GROUP_INDEXES = [4]
-TP_GROUP_INDEXES = [6]
+TP_GROUP_INDEXES = [5]
 SYMBOL_MAPPING = {}
-
 
 def read_config_section(config_file):
     """Read flat key/value config files or standard INI files."""
@@ -151,6 +153,7 @@ def load_chat_config(config_file):
     global CHANNEL_USERNAME, CHANNEL_ID, SIGNAL_PATTERNS, DB_SOURCE, CHAT_CONFIG
     global BROKER, SYMBOL_POSTFIX, TRADING_PLATFORM
     global TERMINAL_INPUT_FOLDER, TERMINAL_OUTPUT_FOLDER, DEFAULT_VOLUME
+    global DIRECTION_GROUP, SYMBOL_GROUP, PRICE_GROUP
     global SL_GROUP_INDEXES, TP_GROUP_INDEXES, SYMBOL_MAPPING
 
     if not os.path.exists(config_file):
@@ -194,6 +197,9 @@ def load_chat_config(config_file):
         symbol_mapping_str = section.get("SYMBOL_MAPPING", "{}")
         SYMBOL_MAPPING = parse_symbol_mapping(symbol_mapping_str)
 
+        DIRECTION_GROUP = int(section.get("DIRECTION_GROUP", 1))
+        SYMBOL_GROUP = int(section.get("SYMBOL_GROUP", 2))
+        PRICE_GROUP = int(section.get("PRICE_GROUP", 3))
         SL_GROUP_INDEXES = _parse_group_indexes(section.get("SL_GROUP"), [4])
         TP_GROUP_INDEXES = _parse_group_indexes(section.get("TP_GROUP"), [6])
 
@@ -213,6 +219,9 @@ def load_chat_config(config_file):
         print(f"Trading platform: {TRADING_PLATFORM}")
         print(f"Symbol postfix: {SYMBOL_POSTFIX}")
         print(f"Default volume: {DEFAULT_VOLUME}")
+        print(f"Direction group: {DIRECTION_GROUP}")
+        print(f"Symbol group: {SYMBOL_GROUP}")
+        print(f"Price group: {PRICE_GROUP}")
         print(f"SL group indexes: {SL_GROUP_INDEXES}")
         print(f"TP group indexes: {TP_GROUP_INDEXES}")
         print(f"Symbol mapping entries: {len(SYMBOL_MAPPING)}")
@@ -329,6 +338,13 @@ def parse_message_ids(input_str):
     return sorted(message_ids)
 
 
+def sanitize_message_text(message_text):
+    """Remove common markdown markers that can break regex parsing."""
+    if not message_text:
+        return ""
+    return re.sub(r"[`*]+", "", message_text)
+
+
 def resolve_symbol(signal_symbol):
     """Resolve symbol by DB mapping first, else fallback to UPPERCASE+postfix."""
     mapped_symbol = get_mapped_symbol(signal_symbol)
@@ -353,26 +369,36 @@ def _pick_group(match, indexes):
 
 
 def parse_signal_message(message_text):
-    """Parse direct BUY/SELL open signals only."""
+    """Parse CREATE market/pending signals from configured regex patterns."""
     default_patterns = {
-        "create_buy": r"BUY\s+([A-Z0-9._/-]+)(?:\s+@?\s*([\d.]+))?\s+SL[:\s]+([\d.]+)\s+TP[:\s]+([\d.]+)",
-        "create_sell": r"SELL\s+([A-Z0-9._/-]+)(?:\s+@?\s*([\d.]+))?\s+SL[:\s]+([\d.]+)\s+TP[:\s]+([\d.]+)",
+        "create_market": r"(BUY|SELL)\s+([A-Z0-9._/-]+)(?:\s+@?\s*([\d.]+))?\s+SL[:\s]+([\d.]+)\s+TP[:\s]+([\d.]+)",
     }
 
     configured_patterns = SIGNAL_PATTERNS or {}
-    patterns = {
-        "create_buy": configured_patterns.get("create_buy", default_patterns["create_buy"]),
-        "create_sell": configured_patterns.get("create_sell", default_patterns["create_sell"]),
-    }
+    patterns = [configured_patterns.get("create_market", default_patterns["create_market"])]
 
-    for action, pattern in patterns.items():
+    pending_pattern = configured_patterns.get("create_pending")
+    if pending_pattern:
+        patterns.append(pending_pattern)
+
+    for pattern in patterns:
         match = re.search(pattern, message_text, re.IGNORECASE)
         if not match:
             continue
 
-        side = "BUY" if action == "create_buy" else "SELL"
-        raw_symbol = match.group(1)
+        # Extract using configured group indexes
+        raw_side = re.sub(r"\s+", " ", (match.group(DIRECTION_GROUP) or "").strip()).upper()
+        raw_symbol = match.group(SYMBOL_GROUP)
+        raw_price_str = re.sub(r"\s+", "", (match.group(PRICE_GROUP) or ""))
+
+        side = raw_side.split(" ", 1)[0]
+        order_type = "MARKET"
         price = 0.0
+
+        if "STOP" in raw_side or "LIMIT" in raw_side:
+            order_type = raw_side.replace(" ", "")
+            price = float(raw_price_str) if raw_price_str else 0.0
+
         raw_sl = _pick_group(match, SL_GROUP_INDEXES)
         raw_tp = _pick_group(match, TP_GROUP_INDEXES)
         sl = float(raw_sl) if raw_sl else 0.0
@@ -381,7 +407,7 @@ def parse_signal_message(message_text):
         return {
             "action": "CREATE",
             "symbol": resolve_symbol(raw_symbol),
-            "type": "MARKET",
+            "type": order_type,
             "side": side,
             "volume": DEFAULT_VOLUME,
             "price": price,
@@ -443,8 +469,10 @@ async def process_message(client, msg_id):
             print(f"Message {msg_id} not found")
             return
 
+        cleaned_text = sanitize_message_text(message.text or "")
+
         print(f"\nProcessing message ID: {msg_id}")
-        print(f"Message text: {message.text}")
+        print(f"Message text: {cleaned_text}")
 
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -456,14 +484,14 @@ async def process_message(client, msg_id):
             print(f"Message {msg_id} already processed, skipping.")
             return
 
-        order_data = parse_signal_message(message.text or "")
+        order_data = parse_signal_message(cleaned_text)
         if not order_data:
             print(f"Message {msg_id} ignored - not a direct BUY/SELL open signal")
             return
 
         order_data["msg_id"] = str(msg_id)
         generate_json_file(order_data, str(msg_id))
-        save_message_to_db(str(msg_id), message.text, order_data["action"], message.text)
+        save_message_to_db(str(msg_id), cleaned_text, order_data["action"], cleaned_text)
         print(f"Successfully processed signal: {order_data}")
     except Exception as exc:
         print(f"Error processing message {msg_id}: {exc}")
@@ -516,6 +544,7 @@ async def main():
     @client.on(events.NewMessage(chats=CHAT_ENTITY))
     async def handler(event):
         msg_id = str(event.message.id)
+        cleaned_text = sanitize_message_text(event.message.text or "")
         print(f"New message received: {msg_id}")
 
         conn = sqlite3.connect(DB_PATH)
@@ -528,14 +557,14 @@ async def main():
             print(f"Message {msg_id} already processed, skipping.")
             return
 
-        order_data = parse_signal_message(event.message.text or "")
+        order_data = parse_signal_message(cleaned_text)
         if not order_data:
             print(f"Message {msg_id} ignored - not a direct BUY/SELL open signal")
             return
 
         order_data["msg_id"] = msg_id
         generate_json_file(order_data, msg_id)
-        save_message_to_db(msg_id, event.message.text, order_data["action"], event.message.text)
+        save_message_to_db(msg_id, cleaned_text, order_data["action"], cleaned_text)
         print(f"Processed signal: {order_data}")
 
     print(f"Monitoring Telegram channel: {CHANNEL_USERNAME or CHANNEL_ID}")

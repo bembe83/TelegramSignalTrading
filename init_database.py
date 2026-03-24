@@ -40,21 +40,21 @@ def init_db():
                     FOREIGN KEY (linked_msg_id) REFERENCES messages(msg_id)
                  )''')
 
-     # Table for per-source symbol mappings (signal symbol -> broker symbol)
-     c.execute('''CREATE TABLE IF NOT EXISTS symbol_mappings (
-                          id INTEGER PRIMARY KEY AUTOINCREMENT,
-                          source TEXT NOT NULL,
-                          signal_symbol TEXT NOT NULL,
-                          mapped_symbol TEXT NOT NULL,
-                          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                          UNIQUE(source, signal_symbol)
-                      )''')
+    # Table for per-source symbol mappings (signal symbol -> broker symbol)
+    c.execute('''CREATE TABLE IF NOT EXISTS symbol_mappings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    signal_symbol TEXT NOT NULL,
+                    mapped_symbol TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(source, signal_symbol)
+                 )''')
 
     # Create indexes for better performance
     c.execute('CREATE INDEX IF NOT EXISTS idx_messages_processed ON messages(processed)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_messages_source ON messages(source)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)')
-     c.execute('CREATE INDEX IF NOT EXISTS idx_symbol_mappings_source ON symbol_mappings(source)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_symbol_mappings_source ON symbol_mappings(source)')
 
     conn.commit()
     conn.close()
