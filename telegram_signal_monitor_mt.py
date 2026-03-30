@@ -322,10 +322,11 @@ def save_message_to_db(msg_id, message_text, action=None, full_message=None):
     """Save a processed message to the database."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    timestamp = datetime.now().isoformat(sep=" ", timespec="seconds")
     c.execute(
         "INSERT OR REPLACE INTO messages (msg_id, message_text, timestamp, action, source, full_message) "
         "VALUES (?, ?, ?, ?, ?, ?)",
-        (msg_id, message_text, datetime.now(), action, DB_SOURCE, full_message),
+        (msg_id, message_text, timestamp, action, DB_SOURCE, full_message),
     )
     conn.commit()
     conn.close()
