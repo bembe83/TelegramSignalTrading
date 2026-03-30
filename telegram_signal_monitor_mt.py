@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import sys
+import warnings
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -80,7 +81,7 @@ def read_config_section(config_file):
                     break
             value = "\n".join(value_lines)
         elif value and value[0] not in ("'", '"'):
-            value = re.split(r"\s(?=[#;])", value, 1)[0].strip()
+            value = re.split(r"\s(?=[#;])", value, maxsplit=1)[0].strip()
 
         section[key] = value
 
@@ -96,13 +97,21 @@ def parse_signal_patterns(raw_patterns):
     if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
         text = text[1:-1]
 
-    for parser in (json.loads, ast.literal_eval):
-        try:
-            parsed = parser(text)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            parsed = ast.literal_eval(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
 
     normalized = re.sub(r"(?<!\\)\\(?![\\\"/bfnrtu])", r"\\\\", text)
     parsed = json.loads(normalized)
@@ -120,13 +129,21 @@ def parse_symbol_mapping(raw_mapping):
     if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
         text = text[1:-1]
 
-    for parser in (json.loads, ast.literal_eval):
-        try:
-            parsed = parser(text)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            parsed = ast.literal_eval(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
 
     normalized = re.sub(r"(?<!\\)\\(?![\\\"/bfnrtu])", r"\\\\", text)
     parsed = json.loads(normalized)
