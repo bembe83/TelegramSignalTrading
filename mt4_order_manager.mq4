@@ -16,6 +16,7 @@ input int CheckInterval = 5000;               // Check interval in milliseconds
 
 // Global variables
 int lastCheckTime = 0;
+string LogFilePath = "orders_errors.log";
 
 // Structure for order data
 struct OrderData {
@@ -146,7 +147,7 @@ bool ParseJSONFile(string filePath, OrderData &order) {
     }
     
     if (order.action == "CREATE") {
-        order.symbol = ToUpper(ExtractStringValue(json, "symbol"));
+        order.symbol = ExtractStringValue(json, "symbol");
         string typeStr = ToUpper(ExtractStringValue(json, "type"));
         string sideStr = ToUpper(ExtractStringValue(json, "side"));
 
@@ -318,6 +319,31 @@ double NormalizePrice(string symbol, double price) {
 }
 
 //+------------------------------------------------------------------+
+//| Log errors to file                                               |
+//+------------------------------------------------------------------+
+void LogError(string action, string msg_id, string errorMsg, int errorCode) {
+    string logPath = LogFilePath;
+    datetime now = TimeCurrent();
+    string timestamp = TimeToString(now, TIME_DATE) + " " + TimeToString(now, TIME_SECONDS);
+    
+    int handle = FileOpen(logPath, FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI);
+    if (handle == INVALID_HANDLE) {
+        handle = FileOpen(logPath, FILE_WRITE | FILE_TXT | FILE_ANSI);
+        if (handle == INVALID_HANDLE) {
+            Print("[LogError] CRITICAL - Cannot create log file: ", logPath, " | Error: ", GetLastError());
+            return;
+        }
+    } else {
+        FileSeek(handle, 0, SEEK_END);
+    }
+    
+    string logEntry = timestamp + " | ACTION: " + action + " | MSG_ID: " + msg_id + " | ERROR: " + errorMsg + " | CODE: " + IntegerToString(errorCode);
+    FileWriteString(handle, logEntry + "\n");
+    FileClose(handle);
+    Print("[LogError] Logged error to file: ", logPath);
+}
+
+//+------------------------------------------------------------------+
 //| Process the order based on action                                |
 //+------------------------------------------------------------------+
 void ProcessOrder(OrderData &order) {
@@ -342,6 +368,7 @@ void CreateOrder(OrderData &order) {
 
     if (!SymbolSelect(order.symbol, true)) {
         Print("[CreateOrder] ERROR - Failed to select symbol: ", order.symbol);
+        LogError("CREATE", order.msg_id, "Failed to select symbol: " + order.symbol, GetLastError());
         return;
     }
 
@@ -355,7 +382,9 @@ void CreateOrder(OrderData &order) {
     
     int ticket = OrderSend(order.symbol, order.type, order.volume, normalizedPrice, 3, normalizedSl, normalizedTp, "JSON Order", 0, 0, clrBlue);
     if (ticket < 0) {
-        Print("[CreateOrder] ERROR - OrderSend failed with error code: ", GetLastError());
+        int errorCode = GetLastError();
+        Print("[CreateOrder] ERROR - OrderSend failed with error code: ", errorCode);
+        LogError("CREATE", order.msg_id, "OrderSend failed", errorCode);
     } else {
         Print("[CreateOrder] SUCCESS - Order created with ticket: ", ticket);
         // Write output file with msg_id and ticket
@@ -365,11 +394,13 @@ void CreateOrder(OrderData &order) {
 
 bool UpdateOpenOrderSLTP(OrderData &order) {
     if (!OrderSelect(order.ticket, SELECT_BY_TICKET)) {
+        LogError("UPDATE", order.msg_id, "Failed to select ticket: " + IntegerToString(order.ticket), GetLastError());
         return false;
     }
 
     int type = OrderType();
     if (type > OP_SELL) {
+        LogError("UPDATE", order.msg_id, "Selected order is not an open position, ticket: " + IntegerToString(order.ticket), 0);
         return false;
     }
 
@@ -378,16 +409,23 @@ bool UpdateOpenOrderSLTP(OrderData &order) {
     double sl = order.sl > 0.0 ? NormalizePrice(symbol, order.sl) : 0.0;
     double tp = order.tp > 0.0 ? NormalizePrice(symbol, order.tp) : 0.0;
 
-    return OrderModify(order.ticket, NormalizePrice(symbol, price), sl, tp, 0, clrGreen);
+    if (!OrderModify(order.ticket, NormalizePrice(symbol, price), sl, tp, 0, clrGreen)) {
+        int errorCode = GetLastError();
+        LogError("UPDATE", order.msg_id, "OrderModify failed for open position, ticket: " + IntegerToString(order.ticket), errorCode);
+        return false;
+    }
+    return true;
 }
 
 bool UpdatePendingOrder(OrderData &order) {
     if (!OrderSelect(order.ticket, SELECT_BY_TICKET)) {
+        LogError("UPDATE", order.msg_id, "Failed to select ticket: " + IntegerToString(order.ticket), GetLastError());
         return false;
     }
 
     int type = OrderType();
     if (type <= OP_SELL) {
+        LogError("UPDATE", order.msg_id, "Selected order is not a pending order, ticket: " + IntegerToString(order.ticket), 0);
         return false;
     }
 
@@ -397,7 +435,12 @@ bool UpdatePendingOrder(OrderData &order) {
     double sl = order.sl > 0.0 ? NormalizePrice(symbol, order.sl) : 0.0;
     double tp = order.tp > 0.0 ? NormalizePrice(symbol, order.tp) : 0.0;
 
-    return OrderModify(order.ticket, NormalizePrice(symbol, newPrice), sl, tp, OrderExpiration(), clrGreen);
+    if (!OrderModify(order.ticket, NormalizePrice(symbol, newPrice), sl, tp, OrderExpiration(), clrGreen)) {
+        int errorCode = GetLastError();
+        LogError("UPDATE", order.msg_id, "OrderModify failed for pending order, ticket: " + IntegerToString(order.ticket), errorCode);
+        return false;
+    }
+    return true;
 }
 
 //+------------------------------------------------------------------+
@@ -438,18 +481,28 @@ void CancelOrder(OrderData &order) {
             // Open order, close it
             Print("[CancelOrder] Closing open order");
             result = OrderClose(order.ticket, OrderLots(), OrderClosePrice(), 3, clrRed);
+            if (!result) {
+                int errorCode = GetLastError();
+                Print("[CancelOrder] ERROR - OrderClose failed with error: ", errorCode);
+                LogError("CANCEL", order.msg_id, "OrderClose failed, ticket: " + IntegerToString(order.ticket), errorCode);
+            } else {
+                Print("[CancelOrder] SUCCESS - Order cancelled: ", order.ticket);
+            }
         } else {
             // Pending order, delete it
             Print("[CancelOrder] Deleting pending order");
             result = OrderDelete(order.ticket);
-        }
-        if (!result) {
-            Print("[CancelOrder] ERROR - Cancel failed with error: ", GetLastError());
-        } else {
-            Print("[CancelOrder] SUCCESS - Order cancelled: ", order.ticket);
+            if (!result) {
+                int errorCode = GetLastError();
+                Print("[CancelOrder] ERROR - OrderDelete failed with error: ", errorCode);
+                LogError("CANCEL", order.msg_id, "OrderDelete failed, ticket: " + IntegerToString(order.ticket), errorCode);
+            } else {
+                Print("[CancelOrder] SUCCESS - Order cancelled: ", order.ticket);
+            }
         }
     } else {
         Print("[CancelOrder] ERROR - Order not found: ", order.ticket);
+        LogError("CANCEL", order.msg_id, "Order not found, ticket: " + IntegerToString(order.ticket), GetLastError());
     }
 }
 
@@ -463,16 +516,20 @@ void CloseOrder(OrderData &order) {
             // This is an open position, close it
             bool result = OrderClose(order.ticket, OrderLots(), OrderClosePrice(), 3, clrOrange);
             if (!result) {
-                Print("[CloseOrder] ERROR - OrderClose failed with error: ", GetLastError());
+                int errorCode = GetLastError();
+                Print("[CloseOrder] ERROR - OrderClose failed with error: ", errorCode);
+                LogError("CLOSE", order.msg_id, "OrderClose failed, ticket: " + IntegerToString(order.ticket), errorCode);
             } else {
                 Print("[CloseOrder] SUCCESS - Order closed: ", order.ticket);
             }
         } else {
             // This is a pending order, not an open position
             Print("[CloseOrder] ERROR - Cannot close pending order, use CANCEL instead: ", order.ticket);
+            LogError("CLOSE", order.msg_id, "Cannot close pending order, use CANCEL instead. Ticket: " + IntegerToString(order.ticket), 0);
         }
     } else {
         Print("[CloseOrder] ERROR - Order not found: ", order.ticket);
+        LogError("CLOSE", order.msg_id, "Order not found, ticket: " + IntegerToString(order.ticket), GetLastError());
     }
 }
 bool MoveFile(string source, string dest) {

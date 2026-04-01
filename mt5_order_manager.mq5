@@ -17,6 +17,8 @@ input int CheckInterval = 5000;
 
 CTrade trade;
 
+string LogFilePath = "orders_errors.log";
+
 struct OrderData {
    string action;
    string msg_id;
@@ -313,10 +315,41 @@ double NormalizePrice(string symbol, double price) {
    return NormalizeDouble(price, digits);
 }
 
-bool SendRequest(MqlTradeRequest &request, MqlTradeResult &result, string context) {
+//+------------------------------------------------------------------+
+//| Log errors to file                                               |
+//+------------------------------------------------------------------+
+void LogError(string action, string msg_id, string errorMsg, int errorCode) {
+   string logPath = LogFilePath;
+   datetime now = TimeCurrent();
+   string timestamp = TimeToString(now, TIME_DATE) + " " + TimeToString(now, TIME_SECONDS);
+   
+   int handle = FileOpen(logPath, FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI);
+   if (handle == INVALID_HANDLE) {
+      handle = FileOpen(logPath, FILE_WRITE | FILE_TXT | FILE_ANSI);
+      if (handle == INVALID_HANDLE) {
+         Print("[LogError] CRITICAL - Cannot create log file: ", logPath, " | Error: ", GetLastError());
+         return;
+      }
+   } else {
+      FileSeek(handle, 0, SEEK_END);
+   }
+   
+   string logEntry = timestamp + " | ACTION: " + action + " | MSG_ID: " + msg_id + " | ERROR: " + errorMsg + " | CODE: " + IntegerToString(errorCode);
+   FileWriteString(handle, logEntry + "\n");
+   FileClose(handle);
+   Print("[LogError] Logged error to file: ", logPath);
+}
+
+//+------------------------------------------------------------------+
+//| Send request and handle errors                                   |
+//+------------------------------------------------------------------+
+bool SendRequest(MqlTradeRequest &request, MqlTradeResult &result, string context, string msg_id = "") {
    ZeroMemory(result);
    if (!OrderSend(request, result)) {
       Print("[", context, "] ERROR - OrderSend failed | Error: ", GetLastError(), " | Retcode: ", result.retcode);
+      if (msg_id != "") {
+         LogError(context, msg_id, "OrderSend failed", (int)GetLastError());
+      }
       return false;
    }
 
@@ -324,6 +357,9 @@ bool SendRequest(MqlTradeRequest &request, MqlTradeResult &result, string contex
        result.retcode != TRADE_RETCODE_DONE_PARTIAL &&
        result.retcode != TRADE_RETCODE_PLACED) {
       Print("[", context, "] ERROR - Trade request rejected | Retcode: ", result.retcode, " | Comment: ", result.comment);
+      if (msg_id != "") {
+         LogError(context, msg_id, "Trade request rejected. Retcode: " + IntegerToString(result.retcode) + " | " + result.comment, result.retcode);
+      }
       return false;
    }
 
@@ -337,6 +373,7 @@ void CreateOrder(OrderData &order) {
 
    if (!SymbolSelect(order.symbol, true)) {
       Print("[CreateOrder] ERROR - Failed to select symbol: ", order.symbol);
+      LogError("CREATE", order.msg_id, "Failed to select symbol: " + order.symbol, (int)GetLastError());
       return;
    }
 
@@ -365,7 +402,7 @@ void CreateOrder(OrderData &order) {
       request.price = NormalizePrice(order.symbol, order.price);
    }
 
-   if (!SendRequest(request, result, "CreateOrder")) {
+   if (!SendRequest(request, result, "CreateOrder", order.msg_id)) {
       return;
    }
 
@@ -374,8 +411,11 @@ void CreateOrder(OrderData &order) {
    WriteOutputFile(order.msg_id, ticket);
 }
 
-bool UpdatePositionSLTP(ulong ticket, double sl, double tp) {
+bool UpdatePositionSLTP(ulong ticket, double sl, double tp, string msg_id = "") {
    if (!PositionSelectByTicket(ticket)) {
+      if (msg_id != "") {
+         LogError("UPDATE", msg_id, "Failed to select position, ticket: " + StringFormat("%I64u", ticket), (int)GetLastError());
+      }
       return false;
    }
 
@@ -391,11 +431,12 @@ bool UpdatePositionSLTP(ulong ticket, double sl, double tp) {
    request.sl = sl > 0.0 ? NormalizePrice(symbol, sl) : 0.0;
    request.tp = tp > 0.0 ? NormalizePrice(symbol, tp) : 0.0;
 
-   return SendRequest(request, result, "UpdateOrder");
+   return SendRequest(request, result, "UpdateOrder", msg_id);
 }
 
 bool UpdatePendingOrder(OrderData &order) {
    if (!OrderSelect(order.ticket)) {
+      LogError("UPDATE", order.msg_id, "Failed to select order, ticket: " + StringFormat("%I64u", order.ticket), (int)GetLastError());
       return false;
    }
 
@@ -415,17 +456,18 @@ bool UpdatePendingOrder(OrderData &order) {
    request.type_time = (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME);
    request.expiration = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
 
-   return SendRequest(request, result, "UpdateOrder");
+   return SendRequest(request, result, "UpdateOrder", order.msg_id);
 }
 
 void UpdateOrder(OrderData &order) {
    Print("[UpdateOrder] DEBUG - Ticket: ", order.ticket, " | Price: ", order.price, " | SL: ", order.sl, " | TP: ", order.tp);
 
    if (PositionSelectByTicket(order.ticket)) {
-      if (UpdatePositionSLTP(order.ticket, order.sl, order.tp)) {
+      if (UpdatePositionSLTP(order.ticket, order.sl, order.tp, order.msg_id)) {
          Print("[UpdateOrder] SUCCESS - Position updated: ", order.ticket);
       } else {
          Print("[UpdateOrder] ERROR - Failed to update position: ", order.ticket);
+         LogError("UPDATE", order.msg_id, "Failed to update position, ticket: " + StringFormat("%I64u", order.ticket), 0);
       }
       return;
    }
@@ -435,11 +477,13 @@ void UpdateOrder(OrderData &order) {
          Print("[UpdateOrder] SUCCESS - Pending order updated: ", order.ticket);
       } else {
          Print("[UpdateOrder] ERROR - Failed to update pending order: ", order.ticket);
+         LogError("UPDATE", order.msg_id, "Failed to update pending order, ticket: " + StringFormat("%I64u", order.ticket), 0);
       }
       return;
    }
 
    Print("[UpdateOrder] ERROR - Ticket not found: ", order.ticket);
+   LogError("UPDATE", order.msg_id, "Ticket not found: " + StringFormat("%I64u", order.ticket), (int)GetLastError());
 }
 
 void CancelOrder(OrderData &order) {
@@ -449,7 +493,9 @@ void CancelOrder(OrderData &order) {
       if (trade.PositionClose(order.ticket)) {
          Print("[CancelOrder] SUCCESS - Position closed: ", order.ticket);
       } else {
-         Print("[CancelOrder] ERROR - PositionClose failed | Retcode: ", trade.ResultRetcode(), " | ", trade.ResultRetcodeDescription());
+         int errorCode = trade.ResultRetcode();
+         Print("[CancelOrder] ERROR - PositionClose failed | Retcode: ", errorCode, " | ", trade.ResultRetcodeDescription());
+         LogError("CANCEL", order.msg_id, "PositionClose failed. Ticket: " + StringFormat("%I64u", order.ticket), errorCode);
       }
       return;
    }
@@ -458,12 +504,15 @@ void CancelOrder(OrderData &order) {
       if (trade.OrderDelete(order.ticket)) {
          Print("[CancelOrder] SUCCESS - Pending order deleted: ", order.ticket);
       } else {
-         Print("[CancelOrder] ERROR - OrderDelete failed | Retcode: ", trade.ResultRetcode(), " | ", trade.ResultRetcodeDescription());
+         int errorCode = trade.ResultRetcode();
+         Print("[CancelOrder] ERROR - OrderDelete failed | Retcode: ", errorCode, " | ", trade.ResultRetcodeDescription());
+         LogError("CANCEL", order.msg_id, "OrderDelete failed. Ticket: " + StringFormat("%I64u", order.ticket), errorCode);
       }
       return;
    }
 
    Print("[CancelOrder] ERROR - Ticket not found: ", order.ticket);
+   LogError("CANCEL", order.msg_id, "Ticket not found: " + StringFormat("%I64u", order.ticket), (int)GetLastError());
 }
 
 void CloseOrder(OrderData &order) {
@@ -473,17 +522,21 @@ void CloseOrder(OrderData &order) {
       if (trade.PositionClose(order.ticket)) {
          Print("[CloseOrder] SUCCESS - Position closed: ", order.ticket);
       } else {
-         Print("[CloseOrder] ERROR - PositionClose failed | Retcode: ", trade.ResultRetcode(), " | ", trade.ResultRetcodeDescription());
+         int errorCode = trade.ResultRetcode();
+         Print("[CloseOrder] ERROR - PositionClose failed | Retcode: ", errorCode, " | ", trade.ResultRetcodeDescription());
+         LogError("CLOSE", order.msg_id, "PositionClose failed. Ticket: " + StringFormat("%I64u", order.ticket), errorCode);
       }
       return;
    }
 
    if (OrderSelect(order.ticket)) {
       Print("[CloseOrder] ERROR - Cannot close a pending order, use CANCEL instead: ", order.ticket);
+      LogError("CLOSE", order.msg_id, "Cannot close pending order. Use CANCEL instead. Ticket: " + StringFormat("%I64u", order.ticket), 0);
       return;
    }
 
    Print("[CloseOrder] ERROR - Ticket not found: ", order.ticket);
+   LogError("CLOSE", order.msg_id, "Ticket not found: " + StringFormat("%I64u", order.ticket), (int)GetLastError());
 }
 
 bool MoveFile(string source, string dest) {
